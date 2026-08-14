@@ -21,6 +21,7 @@ from .core.llm_adapter import LlmMixin
 from .core.message_events import EventsMixin
 from .core.message_sender import SenderMixin
 from .core.notification_center import NotificationCenter
+from .core.native_page_server import NativePageServer
 from .core.plugin_lifecycle import LifecycleMixin
 from .core.session_config import ConfigMixin
 from .core.session_override_manager import SessionOverrideManager
@@ -75,6 +76,9 @@ class ProactiveChatPlugin(
             # Web 管理端属于增强能力，创建失败时仅禁用控制台，不影响插件主体继续加载。
             self.web_admin_server = None
             logger.error(f"[主动消息] Web 管理端组件创建失败喵，已自动禁用: {e}")
+        # 原生 Plugin Pages 适配器：宿主支持时优先把管理端 API 挂到 Dashboard，
+        # 不支持时 available 为 False，生命周期层会回退到独立端口模式。
+        self.native_page_server = NativePageServer(self)
         # 插件版本统一通过版本工具读取，供遥测、通知系统、状态接口等多个模块复用。
         self.version = get_plugin_version()
         # 遥测管理器在插件实例创建阶段即初始化，但真正发请求仍由生命周期阶段控制。
@@ -90,6 +94,9 @@ class ProactiveChatPlugin(
         self._start_time: float = 0.0
         # 保存原 asyncio 全局异常处理器，以便插件卸载时恢复原状。
         self._original_exception_handler = None
+        # 标记是否已接管事件循环异常处理器；必须在创建实例时初始化，
+        # 否则遥测未启用时 terminate 会因缺少该属性而中断后续清理流程。
+        self._exception_handler_installed = False
 
         # 群聊沉默倒计时与自动触发计时器
         self.group_timers: dict[str, asyncio.TimerHandle] = {}

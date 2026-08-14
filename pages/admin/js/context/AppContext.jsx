@@ -36,7 +36,7 @@ const initialState = {
     // 当前选中会话的 base / override / effective 详情。
     sessionDetail: null,
     // 主题优先读取本地存储，确保刷新页面后仍能保持用户偏好。
-    theme: localStorage.getItem('theme') || 'light',
+    theme: window.SafeStorage.getItem('theme') || 'light',
 };
 
 function reducer(state, action) {
@@ -45,7 +45,7 @@ function reducer(state, action) {
         case 'TOGGLE_THEME':
             // 主题切换时同步写入 localStorage，保证跨页面刷新可恢复。
             const newTheme = state.theme === 'light' ? 'dark' : 'light';
-            localStorage.setItem('theme', newTheme);
+            window.SafeStorage.setItem('theme', newTheme);
             return { ...state, theme: newTheme };
         case 'SET_VIEW':
             return { ...state, currentView: action.payload };

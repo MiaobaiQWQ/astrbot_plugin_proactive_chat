@@ -20,24 +20,43 @@ function Sidebar({ currentView, onChange }) {
     // 版本号来自全局状态的 status 快照；未加载前先展示占位文本。
     const version = state.status?.version || '...';
     const unreadNotificationCount = Math.max(0, Number(state.notificationsMeta?.unread_count ?? 0));
-    const [logoSrc, setLogoSrc] = React.useState('/logo.png');
+    // logo 副本随页面一起放在 pages/admin/assets 内（原生 Pages iframe 沙箱不允许引用 Page 根目录之外的文件）。
+    // 原生模式下优先复用启动骨架图中已被 AstrBot 重写（携带 asset_token）的地址。
+    const [logoSrc, setLogoSrc] = React.useState(window.__PROACTIVE_LOGO_URL || 'assets/logo.png');
 
     React.useEffect(() => {
         // 管理端可能被挂载在不同层级路径，依次尝试多个 logo 地址以提高兼容性。
-        const candidates = ['/logo.png', '../logo.png', 'logo.png'];
+        const candidates = [window.__PROACTIVE_LOGO_URL, 'assets/logo.png', '/assets/logo.png', '/logo.png'].filter(Boolean);
+        // 原生 Pages 模式下，运行时发起的资源请求需自行携带页面 URL 上的 asset_token。
+        const pageQuery = /asset_token=/.test(window.location.search || '') ? window.location.search : '';
         let cancelled = false;
+
+        // 用 Image 对象探测候选地址：沙箱 iframe 的 origin 为 null，fetch 会被 CORS 拦截，
+        // 且 AstrBot 内容端点仅支持 GET（HEAD 返回 405），而图片加载天然满足这两个约束。
+        function probe(url) {
+            return new Promise((resolve) => {
+                const img = new Image();
+                img.onload = () => resolve(true);
+                img.onerror = () => resolve(false);
+                img.src = url;
+            });
+        }
 
         async function resolveLogo() {
             for (const candidate of candidates) {
+                const url = pageQuery && candidate.indexOf('http') !== 0 && candidate.indexOf('?') === -1
+                    ? candidate + pageQuery
+                    : candidate;
                 try {
-                    const response = await fetch(candidate, { method: 'HEAD' });
-                    if (response.ok) {
-                        if (!cancelled) setLogoSrc(candidate);
+                    if (await probe(url)) {
+                        // 使用实际加载成功的地址（可能携带 asset_token）作为图片源。
+                        if (!cancelled) setLogoSrc(url);
                         return;
                     }
                 } catch (e) {
                     // 某个候选地址失败并不代表整体失败，继续尝试下一个即可。
                 }
+                if (cancelled) return;
             }
         }
 
@@ -86,8 +105,8 @@ function Sidebar({ currentView, onChange }) {
                     alt="Logo"
                     className="sidebar-logo-img"
                     onError={() => {
-                        // 图片加载失败时再尝试回退到上一级相对路径，兼容静态资源引用差异。
-                        if (logoSrc !== '../logo.png') setLogoSrc('../logo.png');
+                        // 图片加载失败时回退到页面内自带的相对路径副本，兼容静态资源引用差异。
+                        if (logoSrc !== 'assets/logo.png') setLogoSrc('assets/logo.png');
                     }}
                 />
                 <div>

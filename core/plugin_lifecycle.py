@@ -132,9 +132,15 @@ class LifecycleMixin:
                     )
                 )
 
-        # 启动 Web 管理端
+        # 启动 Web 管理端：宿主支持原生 Plugin Pages 时 API 已在实例创建阶段
+        # 挂载到 Dashboard，无需再启动独立端口；否则回退到独立 uvicorn 服务。
         try:
-            if self.web_admin_server:
+            native = getattr(self, "native_page_server", None)
+            if native is not None and native.available:
+                logger.info(
+                    "[主动消息] Web 管理端已接入原生 Plugin Pages 喵，无需独立端口。"
+                )
+            elif self.web_admin_server:
                 await self.web_admin_server.start()
         except Exception as e:
             logger.error(f"[主动消息] Web 管理端启动失败喵: {e}")
@@ -153,15 +159,17 @@ class LifecycleMixin:
         """插件被卸载或停用时调用的清理函数。"""
         logger.info("[主动消息] 收到插件终止指令，开始清理资源喵。")
         try:
-            if self._heartbeat_task:
-                self._heartbeat_task.cancel()
+            # 用 getattr 防御性访问，即使实例初始化不完整也不会中断后续清理。
+            heartbeat_task = getattr(self, "_heartbeat_task", None)
+            if heartbeat_task:
+                heartbeat_task.cancel()
                 try:
-                    await self._heartbeat_task
+                    await heartbeat_task
                 except asyncio.CancelledError:
                     pass
                 self._heartbeat_task = None
 
-            if self.telemetry and self.telemetry.enabled and self._start_time > 0:
+            if self.telemetry and self.telemetry.enabled and getattr(self, "_start_time", 0.0) > 0:
                 runtime_seconds = time.monotonic() - self._start_time
                 # 终止前直接等待一次 shutdown 上报，避免任务刚创建就被后续清理逻辑取消。
                 try:
@@ -173,7 +181,7 @@ class LifecycleMixin:
                 # 再清理其余挂起的 telemetry tasks，避免遗留后台任务。
                 await self._cleanup_telemetry_tasks()
 
-            if self._exception_handler_installed:
+            if getattr(self, "_exception_handler_installed", False):
                 loop = asyncio.get_running_loop()
                 # 恢复条件取决于“是否曾经接管过异常处理器”，
                 # 而不是 terminate 时 telemetry 的当前启用状态。
@@ -243,6 +251,13 @@ class LifecycleMixin:
                     await self.web_admin_server.stop()
                 except Exception as e:
                     logger.warning(f"[主动消息] 停止 Web 管理端时出错喵: {e}")
+
+            # 停止原生 Plugin Pages 适配层（清理 SSE 连接）
+            if getattr(self, "native_page_server", None):
+                try:
+                    await self.native_page_server.stop()
+                except Exception as e:
+                    logger.warning(f"[主动消息] 停止原生 Plugin Pages 时出错喵: {e}")
 
             # 停止通知系统
             if self.notification_center:

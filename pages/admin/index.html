@@ -7,8 +7,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
     <title>主动消息管理端</title>
 
-    <!-- favicon 指向插件根目录的 logo，便于浏览器标签页识别。 -->
-    <link rel="icon" type="image/png" href="../logo.png">
+    <!-- 显式引入 Plugin Pages bridge SDK，确保内联脚本能同步访问 window.AstrBotPluginPage。
+         原生模式下由 AstrBot 提供；独立回退模式下该路径不存在，加载失败静默忽略。 -->
+    <script src="/api/plugin/page/bridge-sdk.js"></script>
+
+    <!-- favicon 使用 pages/admin/assets 内的 logo 副本（iframe 沙箱不允许引用 Page 根目录之外的文件）。 -->
+    <link rel="icon" type="image/png" href="assets/logo.png">
 
     <!-- 预加载字体样式，减少首屏闪烁。 -->
     <link rel="preload" href="fonts/outfit.css" as="style">
@@ -61,7 +65,29 @@
             libsLoaded: 0,
             pendingScripts: [],
             scriptRunning: false,
-            
+
+            // 原生 Plugin Pages 模式下，AstrBot 只重写静态 HTML/CSS/JS import 中的资源引用并
+            // 附加短期 asset_token；运行时动态创建的 script/fetch 不会被重写，
+            // 因此由加载器自行继承当前页面 URL 上的资源授权参数（独立模式下返回空串）。
+            resourceSuffix: (function () {
+                try {
+                    var qs = window.location.search || '';
+                    if (/asset_token=/.test(qs)) {
+                        return qs;
+                    }
+                } catch (e) {}
+                return '';
+            })(),
+
+            // 为动态加载的本地资源补齐授权参数；绝对 URL（如 CDN）原样返回。
+            resolveSrc: function (src) {
+                if (!this.resourceSuffix) return src;
+                if (/^[a-z][a-z0-9+.-]*:\/\//i.test(src) || src.indexOf('//') === 0) {
+                    return src;
+                }
+                return src + this.resourceSuffix;
+            },
+
             // 弹出全局 UI 错误信息并停止加载
             showError: function(msg) {
                 console.error("[ProactiveLoader] " + msg);
@@ -95,7 +121,7 @@
                 var self = this;
                 this.pendingScripts.push(function() {
                     if (isBabel) {
-                        fetch(src)
+                        fetch(self.resolveSrc(src))
                             .then(function(res) {
                                 if (!res.ok) {
                                     throw new Error("HTTP error " + res.status);
@@ -129,7 +155,7 @@
                             });
                     } else {
                         var s = document.createElement('script');
-                        s.src = src;
+                        s.src = self.resolveSrc(src);
                         s.onload = function() {
                             self.scriptRunning = false;
                             self.triggerPendingScripts();
@@ -180,7 +206,7 @@
     <!-- 启动画面：在 React 应用加载前先提供一个可见的骨架屏，避免白屏。 -->
     <div id="loading-skeleton" class="boot-loader">
         <div class="boot-loader__logo">
-            <img src="../logo.png" alt="logo">
+            <img src="assets/logo.png" alt="logo">
         </div>
         <div class="boot-loader__title">主动消息管理端</div>
         <div class="boot-loader__subtitle" id="boot-text">正在初始化...</div>
@@ -199,6 +225,15 @@
     <!-- React 根节点；所有前端界面最终都会挂到这里。 -->
     <div id="root"></div>
 
+    <script>
+        // 记录经 AstrBot 重写后（携带 asset_token）的 logo 地址，供 React 运行时渲染的组件复用；
+        // 原生 Pages 模式下运行时新建的 DOM 不会被自动重写资源路径。
+        (function () {
+            var img = document.querySelector('.boot-loader__logo img');
+            if (img && img.src) window.__PROACTIVE_LOGO_URL = img.src;
+        })();
+    </script>
+
     <!-- 工具脚本必须先于 JSX 模块加载，以便后者可直接使用 window 上的工具对象。 -->
     <script>
         window.ProactiveLoader.queueScript("js/utils/auth.js", false);
@@ -213,6 +248,12 @@
             (function () {
                 // 该标记用于阻止 React 应用过早启动，直到鉴权探测流程结束后再解除。
                 window.__PROACTIVE_AUTH_PENDING = true;
+
+                // 原生 Plugin Pages 模式：鉴权由 Dashboard 承担，无需密码登录流程，直接放行。
+                if (window.AstrBotPluginPage) {
+                    proceed();
+                    return;
+                }
 
                 var bootLoginEventsBound = false;
 

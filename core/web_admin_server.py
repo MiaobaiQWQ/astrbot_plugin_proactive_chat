@@ -56,6 +56,26 @@ def _is_running_in_docker() -> bool:
     return os.environ.get("DOCKER_CONTAINER") == "true"
 
 
+def _port_bind_error(host: str, port: int) -> str | None:
+    """试探性绑定端口，若失败则返回错误描述，成功则返回 None。
+
+    用于在启动 Uvicorn 之前提前发现端口占用等问题：Uvicorn 绑定失败时会
+    直接调用 sys.exit() 使宿主进程崩溃，提前探测可以把失败降级为插件内的
+    普通错误日志。
+    """
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+        return None
+    except OSError as e:
+        return str(e)
+    finally:
+        sock.close()
+
+
 class WebAdminServer:
     """主动消息插件 Web 管理端服务器。"""
 
@@ -74,6 +94,8 @@ class WebAdminServer:
         self._token_cleanup_task: asyncio.Task | None = None
         # 当前已建立的 WebSocket 连接列表，用于广播 UI 更新。
         self._ws_connections: list[WebSocket] = []
+        # 原生 Plugin Pages 模式下 SSE 客户端的推送队列集合，与 WS 共享同一广播源。
+        self._sse_queues: set[asyncio.Queue] = set()
         # 登录令牌默认有效期 24 小时。
         self._token_expire_seconds = 60 * 60 * 24
         # 简单的内存令牌表：token -> 过期时间戳。
@@ -157,8 +179,9 @@ class WebAdminServer:
         if not self.app:
             return
 
-        # admin 目录位于插件根目录下，是整个前端控制台的静态资源根路径。
-        admin_dir = Path(__file__).resolve().parent.parent / "admin"
+        # 前端静态资源位于 pages/admin 目录（同时供原生 Plugin Pages 使用），
+        # 回退的独立模式下把它挂到根路径，便于通过 / 访问前端页面。
+        admin_dir = Path(__file__).resolve().parent.parent / "pages" / "admin"
         if admin_dir.exists():
             # 将根路径直接挂到静态文件目录，便于通过 / 访问前端页面。
             self.app.mount(
@@ -212,206 +235,41 @@ class WebAdminServer:
 
         @self.app.get("/api/markdown-files/{file_path:path}")
         async def get_markdown_file(file_path: str):
-            # FastAPI 已对 path 参数完成一次 URL 解码，这里直接交给白名单解析，避免重复解码破坏合法文件名。
-            resolved = self._resolve_markdown_document(file_path)
-            if not resolved:
-                return JSONResponse(
-                    {"error": "文档不存在或不允许访问"}, status_code=404
-                )
-
-            try:
-                # 文件读取放到线程池中执行，避免阻塞事件循环影响 WebSocket 或其它 HTTP 请求。
-                content = await asyncio.to_thread(resolved.read_text, encoding="utf-8")
-            except UnicodeDecodeError:
-                # 前端当前只按 UTF-8 渲染 Markdown；若编码不匹配，直接返回可理解错误提示。
-                return JSONResponse(
-                    {"error": "文档编码不受支持，仅支持 UTF-8 Markdown 文件"},
-                    status_code=400,
-                )
-            except Exception as e:
-                logger.error(f"[主动消息] 读取 Markdown 文档失败喵: {e}")
-                return JSONResponse(
-                    {"error": "读取文档失败", "message": str(e)}, status_code=500
-                )
-
-            return {
-                # path 返回工作区相对路径，便于前端做目录列表高亮和当前文档定位。
-                "path": self._to_workspace_relative_path(resolved),
-                # title 直接取 stem，减少前端再做文件名拆分。
-                "title": resolved.stem,
-                # content 保留原始 Markdown 文本，由前端统一负责渲染。
-                "content": content,
-                # 显式告诉前端这是 Markdown 内容，方便后续复用统一渲染管线。
-                "content_format": "markdown",
-            }
+            # FastAPI 已对 path 参数完成一次 URL 解码，直接交给共享处理逻辑。
+            return self._respond(*await self._h_get_markdown_file(file_path))
 
         @self.app.get("/api/config")
         async def get_config():
             # 返回配置时显式过滤密码字段，避免管理端读取到明文密码。
-            web_admin = {
-                k: v
-                for k, v in self.config.get("web_admin", {}).items()
-                if k != "password"
-            }
-            return {
-                "friend_settings": dict(self.config.get("friend_settings", {})),
-                "group_settings": dict(self.config.get("group_settings", {})),
-                "web_admin": web_admin,
-                "notification_settings": dict(
-                    self.config.get("notification_settings", {})
-                ),
-            }
+            return self._respond(*await self._h_get_config())
 
         @self.app.get("/api/config-schema")
         async def get_config_schema():
             # Schema 用于前端动态渲染配置表单，而不是写死表单结构。
-            schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
-            if schema_path.exists():
-                try:
-                    # Schema 文件可能较大，因此同样放在线程池读取，减少主循环阻塞。
-                    schema_text = await asyncio.to_thread(
-                        schema_path.read_text, encoding="utf-8"
-                    )
-                    return json.loads(schema_text)
-                except Exception as e:
-                    logger.error(f"[主动消息] 读取 Schema 失败喵: {e}")
-            return {}
+            return self._respond(*await self._h_get_config_schema())
 
         @self.app.post("/api/config")
         async def update_config(payload: dict[str, Any]):
-            # 仅允许更新这三个一级配置块，避免前端误写其它未知字段。
-            allowed_keys = {"friend_settings", "group_settings", "web_admin"}
-            for key in allowed_keys:
-                if key not in payload:
-                    continue
-                if key == "web_admin":
-                    # web_admin 采用增量合并，避免未提交字段被整个覆盖掉。
-                    old = dict(self.config.get("web_admin", {}))
-                    old.update(payload.get("web_admin", {}))
-                    # 密码字段允许显式更新，但不会通过 get_config 回传给前端。
-                    if "password" in payload.get("web_admin", {}):
-                        old["password"] = payload["web_admin"]["password"]
-                    self.config["web_admin"] = old
-                else:
-                    # friend / group 配置块按前端提交的完整对象直接替换。
-                    self.config[key] = payload[key]
-
-            self._save_plugin_config()
-            # 配置变更后立即广播，确保所有已打开页面实时刷新。
-            await self._broadcast_update("config")
-            return {"ok": True}
+            return self._respond(*await self._h_update_config(payload))
 
         @self.app.get("/api/session-config/sessions")
         async def list_session_configs():
             # 汇总所有已知会话，给前端会话差异配置页做选择器与列表展示。
-            sessions = self._list_known_sessions()
-            result = []
-            for session in sessions:
-                override = self.plugin.session_override_manager.get_override(session)
-                effective = self.plugin._get_session_config(session)
-                session_name = self.plugin._get_session_name(session, effective)
-                result.append(
-                    {
-                        "session": session,
-                        "session_name": session_name,
-                        "session_display_name": self.plugin._get_session_display_name(
-                            session, effective
-                        ),
-                        # 标记是否存在会话级覆写，前端可据此展示提示标签。
-                        "has_override": bool(override),
-                        # 额外把 override keys 暴露给前端，便于提示“哪些配置项被会话级改写”。
-                        "override_keys": list(override.keys()),
-                        # effective 可能为空，因此这里需要防御式布尔判断。
-                        "enabled": bool(effective and effective.get("enable", False)),
-                        # 从运行时会话数据中拿到下一次触发时间，用于列表辅助信息展示。
-                        "next_trigger_time": self.plugin.session_data.get(
-                            session, {}
-                        ).get("next_trigger_time"),
-                        "unanswered_count": self.plugin.session_data.get(
-                            session, {}
-                        ).get("unanswered_count", 0),
-                    }
-                )
-            return {"sessions": result}
+            return self._respond(*await self._h_list_session_configs())
 
         @self.app.get("/api/session-config/{umo:path}")
         async def get_session_config(umo: str):
             # 路径参数使用 path 转换器，允许会话 ID 中包含斜杠等特殊字符。
-            normalized = self.plugin._normalize_session_id(umo)
-            base = self.plugin._get_base_session_config(normalized)
-            return {
-                "session": normalized,
-                # base 表示命中 friend/group 全局配置后的基础配置。
-                "base": base,
-                # override 是该会话显式保存的差异字段。
-                "override": self.plugin.session_override_manager.get_override(
-                    normalized
-                ),
-                # effective 是基础配置与覆写合并后的最终生效配置。
-                "effective": self.plugin._get_session_config(normalized),
-            }
+            return self._respond(*await self._h_get_session_config(umo))
 
         @self.app.post("/api/session-config/{umo:path}")
         async def update_session_config(umo: str, payload: dict[str, Any]):
-            normalized = self.plugin._normalize_session_id(umo)
-            # mode 用于兼容两种写法：直接提交 override，或提交最终 effective 配置。
-            mode = payload.get("mode", "effective")
-
-            if mode == "override":
-                override = payload.get("override", {})
-                if not isinstance(override, dict):
-                    return JSONResponse(
-                        {"error": "override 必须是对象"}, status_code=400
-                    )
-                # override 模式由前端显式提交差异配置，后端不再做反推。
-                await self.plugin.session_override_manager.set_override(
-                    normalized, override
-                )
-            else:
-                effective = payload.get("effective", {})
-                if not isinstance(effective, dict):
-                    return JSONResponse(
-                        {"error": "effective 必须是对象"}, status_code=400
-                    )
-                base = self.plugin._get_base_session_config(normalized)
-                if not base:
-                    # 没有基础配置时无法反推出差异项，因此拒绝保存 effective。
-                    return JSONResponse(
-                        {
-                            "error": "会话未命中 friend/group 全局配置，无法保存 effective"
-                        },
-                        status_code=400,
-                    )
-                await (
-                    self.plugin.session_override_manager.update_session_from_effective(
-                        normalized,
-                        base,
-                        effective,
-                    )
-                )
-
-            await self._broadcast_update("session-config")
-            return {
-                "ok": True,
-                "session": normalized,
-                "override": self.plugin.session_override_manager.get_override(
-                    normalized
-                ),
-                "effective": self.plugin._get_session_config(normalized),
-            }
+            return self._respond(*await self._h_update_session_config(umo, payload))
 
         @self.app.delete("/api/session-config/{umo:path}")
         async def reset_session_config(umo: str):
             # 删除覆写后，会话会重新完全继承全局配置。
-            normalized = self.plugin._normalize_session_id(umo)
-            await self.plugin.session_override_manager.delete_override(normalized)
-            await self._broadcast_update("session-config")
-            return {
-                "ok": True,
-                "session": normalized,
-                "override": {},
-                "effective": self.plugin._get_session_config(normalized),
-            }
+            return self._respond(*await self._h_reset_session_config(umo))
 
         @self.app.get("/api/jobs")
         async def list_jobs():
@@ -420,27 +278,7 @@ class WebAdminServer:
 
         @self.app.post("/api/jobs/{umo:path}/reschedule")
         async def reschedule_job(umo: str):
-            normalized = self.plugin._normalize_session_id(umo)
-            session_config = self.plugin._get_session_config(normalized)
-            if not session_config or not session_config.get("enable", False):
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "session": normalized,
-                        "error": "会话未启用或配置不存在，无法重新调度",
-                    },
-                    status_code=400,
-                )
-
-            await self.plugin._schedule_next_chat_and_save(
-                normalized, reset_counter=False
-            )
-            await self._broadcast_update("jobs")
-            return {
-                "ok": True,
-                "session": normalized,
-                "message": "已重新调度下一次主动消息时间",
-            }
+            return self._respond(*await self._h_reschedule_job(umo))
 
         @self.app.get("/api/notifications")
         async def get_notifications():
@@ -450,208 +288,29 @@ class WebAdminServer:
 
         @self.app.post("/api/notifications/read")
         async def mark_notification_read(payload: dict[str, Any]):
-            # 单条已读只影响插件本地缓存中的 read_map，不涉及远端接口写回。
-            if not getattr(self.plugin, "notification_center", None):
-                return JSONResponse({"error": "通知系统不可用"}, status_code=503)
-
-            notification_id = payload.get("id")
-            if notification_id is None:
-                return JSONResponse({"error": "缺少必填字段 id"}, status_code=400)
-            try:
-                # 前端传值可能是字符串，因此这里统一转成 int，方便下游逻辑处理。
-                normalized_id = int(notification_id)
-            except (TypeError, ValueError):
-                return JSONResponse({"error": "id 必须是数字"}, status_code=400)
-
-            result = await self.plugin.notification_center.mark_as_read(normalized_id)
-            await self._broadcast_update("notifications")
-            return result
+            return self._respond(*await self._h_mark_notification_read(payload))
 
         @self.app.post("/api/notifications/read-all")
         async def mark_all_notifications_read():
-            # 批量已读后立即广播，保证多个已打开页面的未读角标同步归零。
-            if not getattr(self.plugin, "notification_center", None):
-                return JSONResponse({"error": "通知系统不可用"}, status_code=503)
-            result = await self.plugin.notification_center.mark_all_as_read()
-            await self._broadcast_update("notifications")
-            return result
+            return self._respond(*await self._h_mark_all_notifications_read())
 
         @self.app.post("/api/notifications/refresh")
         async def refresh_notifications():
             # 供前端“立即同步”按钮调用，强制拉取远端最新通知并回传完整快照。
-            if not getattr(self.plugin, "notification_center", None):
-                return JSONResponse({"error": "通知系统不可用"}, status_code=503)
-            changed = await self.plugin.notification_center.refresh()
-            # 即便 changed 为 False，也广播一次，确保当前页面拿到最新同步时间等元信息。
-            await self._broadcast_update("notifications")
-            payload = await self.plugin.notification_center.get_payload()
-            return {
-                "ok": True,
-                "changed": changed,
-                "items": payload.get("items", []),
-                "meta": payload.get("meta", {}),
-            }
+            return self._respond(*await self._h_refresh_notifications())
 
         @self.app.post("/api/open-directory")
         async def open_directory(payload: dict[str, Any]):
             # 允许前端请求打开插件目录或数据目录，便于管理员快速定位文件。
-            target = str(payload.get("path", "plugin")).strip().lower()
-            if target == "data":
-                directory = Path(self.plugin.data_dir)
-            else:
-                # 默认回退到插件根目录，保证前端传值异常时仍有一个安全目标。
-                directory = Path(__file__).resolve().parent.parent
-
-            try:
-                # 确保目录存在，再根据当前系统选择合适的打开方式。
-                directory.mkdir(parents=True, exist_ok=True)
-                dir_str = str(directory)
-
-                if _is_running_in_docker():
-                    return JSONResponse(
-                        {
-                            "error": "Docker 环境下不支持在宿主机直接打开目录，请手动查看挂载路径",
-                            "path": dir_str,
-                        },
-                        status_code=400,
-                    )
-
-                if os.name == "nt":
-                    # Windows 使用系统默认资源管理器，封装为异步避免阻塞事件循环。
-                    await asyncio.to_thread(os.startfile, dir_str)
-                elif sys.platform == "darwin":
-                    # macOS 通过 open 命令调起 Finder；失败时把 stderr 带回前端便于定位。
-                    result = await asyncio.to_thread(
-                        subprocess.run,
-                        ["open", dir_str],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if result.returncode != 0:
-                        detail = (result.stderr or result.stdout or "未知错误").strip()
-                        return JSONResponse(
-                            {
-                                "error": "打开目录失败（macOS）",
-                                "message": f"open 命令执行失败: {detail}",
-                                "path": dir_str,
-                            },
-                            status_code=500,
-                        )
-                else:
-                    # 其它类 Unix 系统优先尝试 xdg-open，兼容常见 Linux 桌面环境。
-                    result = await asyncio.to_thread(
-                        subprocess.run,
-                        ["xdg-open", dir_str],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if result.returncode != 0:
-                        detail = (result.stderr or result.stdout or "未知错误").strip()
-                        return JSONResponse(
-                            {
-                                "error": "打开目录失败（Linux）",
-                                "message": (
-                                    "xdg-open 执行失败，服务器可能缺少桌面环境或未安装 xdg-open: "
-                                    f"{detail}"
-                                ),
-                                "path": dir_str,
-                            },
-                            status_code=500,
-                        )
-
-                return {
-                    "ok": True,
-                    "path": dir_str,
-                    "message": "已在系统文件管理器中打开目录",
-                }
-            except FileNotFoundError as e:
-                logger.error(f"[主动消息] 打开目录失败（命令缺失）喵: {e}")
-                return JSONResponse(
-                    {
-                        "error": "打开目录失败：系统缺少所需命令",
-                        "message": "请确认系统已安装对应文件管理器命令（如 open / xdg-open）",
-                        "path": str(directory),
-                    },
-                    status_code=500,
-                )
-            except PermissionError as e:
-                logger.error(f"[主动消息] 打开目录失败（权限不足）喵: {e}")
-                return JSONResponse(
-                    {
-                        "error": "打开目录失败：权限不足",
-                        "message": str(e),
-                        "path": str(directory),
-                    },
-                    status_code=500,
-                )
-            except Exception as e:
-                logger.error(f"[主动消息] 打开目录失败喵: {e}")
-                return JSONResponse(
-                    {
-                        "error": "打开目录失败",
-                        "message": str(e),
-                        "path": str(directory),
-                    },
-                    status_code=500,
-                )
+            return self._respond(*await self._h_open_directory(payload))
 
         @self.app.post("/api/jobs/{umo:path}/trigger")
         async def trigger_job(umo: str):
-            # 立即手动触发一次指定会话的检查与发言流程；同一会话在执行完成前禁止重复触发。
-            normalized = self.plugin._normalize_session_id(umo)
-            if normalized in self.plugin.manual_trigger_sessions:
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "session": normalized,
-                        "in_progress": True,
-                        "message": "该任务正在立即触发中，请等待当前执行完成",
-                    },
-                    status_code=409,
-                )
-
-            self.plugin.manual_trigger_sessions.add(normalized)
-            # 主动创建后台任务，避免前端请求长时间挂起等待业务执行完成。
-            asyncio.create_task(self.plugin.check_and_chat(normalized))
-            await self._broadcast_update("jobs")
-            return {
-                "ok": True,
-                "session": normalized,
-                "in_progress": True,
-                "message": "已开始立即触发，正在等待 LLM 完成回复",
-            }
+            return self._respond(*await self._h_trigger_job(umo))
 
         @self.app.delete("/api/jobs/{umo:path}")
         async def cancel_job(umo: str):
-            normalized = self.plugin._normalize_session_id(umo)
-            removed = False
-            try:
-                # APScheduler 中的 job id 直接使用规范化后的 session id。
-                self.plugin.scheduler.remove_job(normalized)
-                removed = True
-            except Exception:
-                # 任务不存在时保持幂等，不把异常直接抛给前端。
-                pass
-
-            async with self.plugin.data_lock:
-                if normalized in self.plugin.session_data:
-                    # 同步清理持久化数据中的 next_trigger_time，避免界面显示过期信息。
-                    self.plugin.session_data[normalized].pop("next_trigger_time", None)
-                    await self.plugin._save_data_internal()
-
-            if removed:
-                logger.info(
-                    f"[主动消息] Web 管理端已取消 {self.plugin._get_session_log_str(normalized)} 的调度任务喵。"
-                )
-            else:
-                logger.warning(
-                    f"[主动消息] Web 管理端请求取消 {self.plugin._get_session_log_str(normalized)} 的调度任务喵，但当前未找到可取消任务。"
-                )
-
-            await self._broadcast_update("jobs")
-            return {"ok": True, "session": normalized, "removed": removed}
+            return self._respond(*await self._h_cancel_job(umo))
 
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
@@ -727,6 +386,390 @@ class WebAdminServer:
                 # 无论异常还是正常断开，都必须回收连接引用，避免广播时残留死连接。
                 if websocket in self._ws_connections:
                     self._ws_connections.remove(websocket)
+
+    async def _h_get_markdown_file(self, file_path: str) -> tuple[dict[str, Any], int]:
+        """读取指定 Markdown 文档，返回 (载荷, 状态码)，供独立端与原生端共用。"""
+        resolved = self._resolve_markdown_document(file_path)
+        if not resolved:
+            return {"error": "文档不存在或不允许访问"}, 404
+
+        try:
+            # 文件读取放到线程池中执行，避免阻塞事件循环影响实时推送或其它 HTTP 请求。
+            content = await asyncio.to_thread(resolved.read_text, encoding="utf-8")
+        except UnicodeDecodeError:
+            # 前端当前只按 UTF-8 渲染 Markdown；若编码不匹配，直接返回可理解错误提示。
+            return {"error": "文档编码不受支持，仅支持 UTF-8 Markdown 文件"}, 400
+        except Exception as e:
+            logger.error(f"[主动消息] 读取 Markdown 文档失败喵: {e}")
+            return {"error": "读取文档失败", "message": str(e)}, 500
+
+        return {
+            # path 返回工作区相对路径，便于前端做目录列表高亮和当前文档定位。
+            "path": self._to_workspace_relative_path(resolved),
+            "title": resolved.stem,
+            "content": content,
+            "content_format": "markdown",
+        }, 200
+
+    async def _h_get_config(self) -> tuple[dict[str, Any], int]:
+        """读取全局配置（过滤密码字段），返回 (载荷, 状态码)。"""
+        web_admin = {
+            k: v
+            for k, v in self.config.get("web_admin", {}).items()
+            if k != "password"
+        }
+        return {
+            "friend_settings": dict(self.config.get("friend_settings", {})),
+            "group_settings": dict(self.config.get("group_settings", {})),
+            "web_admin": web_admin,
+            "notification_settings": dict(
+                self.config.get("notification_settings", {})
+            ),
+        }, 200
+
+    async def _h_get_config_schema(self) -> tuple[dict[str, Any], int]:
+        """读取 _conf_schema.json 供前端动态渲染配置表单。"""
+        schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
+        if schema_path.exists():
+            try:
+                # Schema 文件可能较大，因此同样放在线程池读取，减少主循环阻塞。
+                schema_text = await asyncio.to_thread(
+                    schema_path.read_text, encoding="utf-8"
+                )
+                return json.loads(schema_text), 200
+            except Exception as e:
+                logger.error(f"[主动消息] 读取 Schema 失败喵: {e}")
+        return {}, 200
+
+    async def _h_update_config(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """按白名单更新全局配置并广播。"""
+        # 仅允许更新这三个一级配置块，避免前端误写其它未知字段。
+        allowed_keys = {"friend_settings", "group_settings", "web_admin"}
+        for key in allowed_keys:
+            if key not in payload:
+                continue
+            if key == "web_admin":
+                # web_admin 采用增量合并，避免未提交字段被整个覆盖掉。
+                old = dict(self.config.get("web_admin", {}))
+                old.update(payload.get("web_admin", {}))
+                # 密码字段允许显式更新，但不会通过 get_config 回传给前端。
+                if "password" in payload.get("web_admin", {}):
+                    old["password"] = payload["web_admin"]["password"]
+                self.config["web_admin"] = old
+            else:
+                # friend / group 配置块按前端提交的完整对象直接替换。
+                self.config[key] = payload[key]
+
+        self._save_plugin_config()
+        # 配置变更后立即广播，确保所有已打开页面实时刷新。
+        await self._broadcast_update("config")
+        return {"ok": True}, 200
+
+    async def _h_list_session_configs(self) -> tuple[dict[str, Any], int]:
+        """汇总所有已知会话及其覆写状态，供会话差异配置页使用。"""
+        sessions = self._list_known_sessions()
+        result = []
+        for session in sessions:
+            override = self.plugin.session_override_manager.get_override(session)
+            effective = self.plugin._get_session_config(session)
+            session_name = self.plugin._get_session_name(session, effective)
+            result.append(
+                {
+                    "session": session,
+                    "session_name": session_name,
+                    "session_display_name": self.plugin._get_session_display_name(
+                        session, effective
+                    ),
+                    # 标记是否存在会话级覆写，前端可据此展示提示标签。
+                    "has_override": bool(override),
+                    # 额外把 override keys 暴露给前端，便于提示“哪些配置项被会话级改写”。
+                    "override_keys": list(override.keys()),
+                    # effective 可能为空，因此这里需要防御式布尔判断。
+                    "enabled": bool(effective and effective.get("enable", False)),
+                    # 从运行时会话数据中拿到下一次触发时间，用于列表辅助信息展示。
+                    "next_trigger_time": self.plugin.session_data.get(
+                        session, {}
+                    ).get("next_trigger_time"),
+                    "unanswered_count": self.plugin.session_data.get(
+                        session, {}
+                    ).get("unanswered_count", 0),
+                }
+            )
+        return {"sessions": result}, 200
+
+    async def _h_get_session_config(self, umo: str) -> tuple[dict[str, Any], int]:
+        """返回指定会话的 base/override/effective 三层配置。"""
+        normalized = self.plugin._normalize_session_id(umo)
+        base = self.plugin._get_base_session_config(normalized)
+        return {
+            "session": normalized,
+            # base 表示命中 friend/group 全局配置后的基础配置。
+            "base": base,
+            # override 是该会话显式保存的差异字段。
+            "override": self.plugin.session_override_manager.get_override(
+                normalized
+            ),
+            # effective 是基础配置与覆写合并后的最终生效配置。
+            "effective": self.plugin._get_session_config(normalized),
+        }, 200
+
+    async def _h_update_session_config(
+        self, umo: str, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], int]:
+        """保存会话级配置（支持 override 与 effective 两种模式）。"""
+        normalized = self.plugin._normalize_session_id(umo)
+        # mode 用于兼容两种写法：直接提交 override，或提交最终 effective 配置。
+        mode = payload.get("mode", "effective")
+
+        if mode == "override":
+            override = payload.get("override", {})
+            if not isinstance(override, dict):
+                return {"error": "override 必须是对象"}, 400
+            # override 模式由前端显式提交差异配置，后端不再做反推。
+            await self.plugin.session_override_manager.set_override(
+                normalized, override
+            )
+        else:
+            effective = payload.get("effective", {})
+            if not isinstance(effective, dict):
+                return {"error": "effective 必须是对象"}, 400
+            base = self.plugin._get_base_session_config(normalized)
+            if not base:
+                # 没有基础配置时无法反推出差异项，因此拒绝保存 effective。
+                return {
+                    "error": "会话未命中 friend/group 全局配置，无法保存 effective"
+                }, 400
+            await (
+                self.plugin.session_override_manager.update_session_from_effective(
+                    normalized,
+                    base,
+                    effective,
+                )
+            )
+
+        await self._broadcast_update("session-config")
+        return {
+            "ok": True,
+            "session": normalized,
+            "override": self.plugin.session_override_manager.get_override(
+                normalized
+            ),
+            "effective": self.plugin._get_session_config(normalized),
+        }, 200
+
+    async def _h_reset_session_config(self, umo: str) -> tuple[dict[str, Any], int]:
+        """删除会话覆写，使其重新完全继承全局配置。"""
+        normalized = self.plugin._normalize_session_id(umo)
+        await self.plugin.session_override_manager.delete_override(normalized)
+        await self._broadcast_update("session-config")
+        return {
+            "ok": True,
+            "session": normalized,
+            "override": {},
+            "effective": self.plugin._get_session_config(normalized),
+        }, 200
+
+    async def _h_reschedule_job(self, umo: str) -> tuple[dict[str, Any], int]:
+        """重新调度指定会话的下一次主动消息。"""
+        normalized = self.plugin._normalize_session_id(umo)
+        session_config = self.plugin._get_session_config(normalized)
+        if not session_config or not session_config.get("enable", False):
+            return {
+                "ok": False,
+                "session": normalized,
+                "error": "会话未启用或配置不存在，无法重新调度",
+            }, 400
+
+        await self.plugin._schedule_next_chat_and_save(
+            normalized, reset_counter=False
+        )
+        await self._broadcast_update("jobs")
+        return {
+            "ok": True,
+            "session": normalized,
+            "message": "已重新调度下一次主动消息时间",
+        }, 200
+
+    async def _h_trigger_job(self, umo: str) -> tuple[dict[str, Any], int]:
+        """立即手动触发一次指定会话的检查与发言流程；同一会话禁止重复触发。"""
+        normalized = self.plugin._normalize_session_id(umo)
+        if normalized in self.plugin.manual_trigger_sessions:
+            return {
+                "ok": False,
+                "session": normalized,
+                "in_progress": True,
+                "message": "该任务正在立即触发中，请等待当前执行完成",
+            }, 409
+
+        self.plugin.manual_trigger_sessions.add(normalized)
+        # 主动创建后台任务，避免前端请求长时间挂起等待业务执行完成。
+        asyncio.create_task(self.plugin.check_and_chat(normalized))
+        await self._broadcast_update("jobs")
+        return {
+            "ok": True,
+            "session": normalized,
+            "in_progress": True,
+            "message": "已开始立即触发，正在等待 LLM 完成回复",
+        }, 200
+
+    async def _h_cancel_job(self, umo: str) -> tuple[dict[str, Any], int]:
+        """取消指定会话的调度任务并清理持久化的触发时间。"""
+        normalized = self.plugin._normalize_session_id(umo)
+        removed = False
+        try:
+            # APScheduler 中的 job id 直接使用规范化后的 session id。
+            self.plugin.scheduler.remove_job(normalized)
+            removed = True
+        except Exception:
+            # 任务不存在时保持幂等，不把异常直接抛给前端。
+            pass
+
+        async with self.plugin.data_lock:
+            if normalized in self.plugin.session_data:
+                # 同步清理持久化数据中的 next_trigger_time，避免界面显示过期信息。
+                self.plugin.session_data[normalized].pop("next_trigger_time", None)
+                await self.plugin._save_data_internal()
+
+        if removed:
+            logger.info(
+                f"[主动消息] Web 管理端已取消 {self.plugin._get_session_log_str(normalized)} 的调度任务喵。"
+            )
+        else:
+            logger.warning(
+                f"[主动消息] Web 管理端请求取消 {self.plugin._get_session_log_str(normalized)} 的调度任务喵，但当前未找到可取消任务。"
+            )
+
+        await self._broadcast_update("jobs")
+        return {"ok": True, "session": normalized, "removed": removed}, 200
+
+    async def _h_mark_notification_read(
+        self, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], int]:
+        """单条通知标记已读，只影响插件本地缓存中的 read_map。"""
+        if not getattr(self.plugin, "notification_center", None):
+            return {"error": "通知系统不可用"}, 503
+
+        notification_id = payload.get("id")
+        if notification_id is None:
+            return {"error": "缺少必填字段 id"}, 400
+        try:
+            # 前端传值可能是字符串，因此这里统一转成 int，方便下游逻辑处理。
+            normalized_id = int(notification_id)
+        except (TypeError, ValueError):
+            return {"error": "id 必须是数字"}, 400
+
+        result = await self.plugin.notification_center.mark_as_read(normalized_id)
+        await self._broadcast_update("notifications")
+        return result, 200
+
+    async def _h_mark_all_notifications_read(self) -> tuple[dict[str, Any], int]:
+        """批量已读后立即广播，保证多个已打开页面的未读角标同步归零。"""
+        if not getattr(self.plugin, "notification_center", None):
+            return {"error": "通知系统不可用"}, 503
+        result = await self.plugin.notification_center.mark_all_as_read()
+        await self._broadcast_update("notifications")
+        return result, 200
+
+    async def _h_refresh_notifications(self) -> tuple[dict[str, Any], int]:
+        """强制拉取远端最新通知并回传完整快照。"""
+        if not getattr(self.plugin, "notification_center", None):
+            return {"error": "通知系统不可用"}, 503
+        changed = await self.plugin.notification_center.refresh()
+        # 即便 changed 为 False，也广播一次，确保当前页面拿到最新同步时间等元信息。
+        await self._broadcast_update("notifications")
+        payload = await self.plugin.notification_center.get_payload()
+        return {
+            "ok": True,
+            "changed": changed,
+            "items": payload.get("items", []),
+            "meta": payload.get("meta", {}),
+        }, 200
+
+    async def _h_open_directory(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """在系统文件管理器中打开插件目录或数据目录。"""
+        target = str(payload.get("path", "plugin")).strip().lower()
+        if target == "data":
+            directory = Path(self.plugin.data_dir)
+        else:
+            # 默认回退到插件根目录，保证前端传值异常时仍有一个安全目标。
+            directory = Path(__file__).resolve().parent.parent
+
+        try:
+            # 确保目录存在，再根据当前系统选择合适的打开方式。
+            directory.mkdir(parents=True, exist_ok=True)
+            dir_str = str(directory)
+
+            if _is_running_in_docker():
+                return {
+                    "error": "Docker 环境下不支持在宿主机直接打开目录，请手动查看挂载路径",
+                    "path": dir_str,
+                }, 400
+
+            if os.name == "nt":
+                # Windows 使用系统默认资源管理器，封装为异步避免阻塞事件循环。
+                await asyncio.to_thread(os.startfile, dir_str)
+            elif sys.platform == "darwin":
+                # macOS 通过 open 命令调起 Finder；失败时把 stderr 带回前端便于定位。
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["open", dir_str],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout or "未知错误").strip()
+                    return {
+                        "error": "打开目录失败（macOS）",
+                        "message": f"open 命令执行失败: {detail}",
+                        "path": dir_str,
+                    }, 500
+            else:
+                # 其它类 Unix 系统优先尝试 xdg-open，兼容常见 Linux 桌面环境。
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ["xdg-open", dir_str],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout or "未知错误").strip()
+                    return {
+                        "error": "打开目录失败（Linux）",
+                        "message": (
+                            "xdg-open 执行失败，服务器可能缺少桌面环境或未安装 xdg-open: "
+                            f"{detail}"
+                        ),
+                        "path": dir_str,
+                    }, 500
+
+            return {
+                "ok": True,
+                "path": dir_str,
+                "message": "已在系统文件管理器中打开目录",
+            }, 200
+        except FileNotFoundError as e:
+            logger.error(f"[主动消息] 打开目录失败（命令缺失）喵: {e}")
+            return {
+                "error": "打开目录失败：系统缺少所需命令",
+                "message": "请确认系统已安装对应文件管理器命令（如 open / xdg-open）",
+                "path": str(directory),
+            }, 500
+        except PermissionError as e:
+            logger.error(f"[主动消息] 打开目录失败（权限不足）喵: {e}")
+            return {
+                "error": "打开目录失败：权限不足",
+                "message": str(e),
+                "path": str(directory),
+            }, 500
+        except Exception as e:
+            logger.error(f"[主动消息] 打开目录失败喵: {e}")
+            return {
+                "error": "打开目录失败",
+                "message": str(e),
+                "path": str(directory),
+            }, 500
 
     def _save_plugin_config(self) -> None:
         try:
@@ -1219,9 +1262,39 @@ class WebAdminServer:
             if ws in self._ws_connections:
                 self._ws_connections.remove(ws)
 
+        # 同步分发给原生 Pages 的 SSE 客户端；队列积压满时丢弃该慢连接，避免阻塞广播。
+        for queue in list(self._sse_queues):
+            try:
+                queue.put_nowait(payload)
+            except Exception:
+                self._sse_queues.discard(queue)
+
+    def register_sse_queue(self, queue: asyncio.Queue) -> None:
+        """登记一个 SSE 客户端推送队列，由原生 Pages 适配层调用。"""
+        self._sse_queues.add(queue)
+
+    def unregister_sse_queue(self, queue: asyncio.Queue) -> None:
+        """移除 SSE 客户端推送队列，连接关闭时必须调用以免残留。"""
+        self._sse_queues.discard(queue)
+
+    def stop_all_sse(self) -> None:
+        """向所有 SSE 队列投递哨兵并清空，插件终止时调用。"""
+        for queue in list(self._sse_queues):
+            try:
+                queue.put_nowait(None)
+            except Exception:
+                pass
+        self._sse_queues.clear()
+
+    def _respond(self, payload: dict[str, Any], status_code: int) -> Any:
+        """将统一 (载荷, 状态码) 结果转换为 FastAPI 响应。"""
+        if status_code != 200:
+            return JSONResponse(payload, status_code=status_code)
+        return payload
+
     async def _broadcast_update(self, reason: str) -> None:
-        # 若当前没有任何活跃前端连接，则无需构造完整广播载荷，可直接返回。
-        if not self._ws_connections:
+        # 若当前没有任何活跃前端连接（WS 或 SSE），则无需构造完整广播载荷，可直接返回。
+        if not self._ws_connections and not self._sse_queues:
             return
 
         payload = {
@@ -1239,7 +1312,7 @@ class WebAdminServer:
 
     async def _broadcast_notification_meta_update(self, reason: str) -> None:
         # 轻量广播仅同步通知元信息，避免在轮询无内容变更时重复发送完整通知列表。
-        if not self._ws_connections:
+        if not self._ws_connections and not self._sse_queues:
             return
 
         if not getattr(self.plugin, "notification_center", None):
@@ -1284,6 +1357,22 @@ class WebAdminServer:
         host = web_admin.get("host", "127.0.0.1")
         port = int(web_admin.get("port", 4100))
 
+        # 提前探测端口可用性：Uvicorn 绑定失败时会 sys.exit(STARTUP_FAILURE)，
+        # 会把异常扩散到宿主 AstrBot 进程导致整体退出，这里先做防御性检查。
+        # 插件重载时旧服务器可能仍在优雅退出中，短暂重试几次等待端口释放。
+        bind_error = None
+        for _ in range(10):
+            bind_error = _port_bind_error(host, port)
+            if bind_error is None:
+                break
+            await asyncio.sleep(0.5)
+        if bind_error:
+            logger.error(
+                f"[主动消息] Web 管理端启动失败喵: 端口 {host}:{port} 不可用（{bind_error}），"
+                "请检查是否有残留进程占用端口，或在插件设置中更换端口喵。"
+            )
+            return
+
         # 采用 Uvicorn 内嵌启动，便于作为插件内部协程任务运行。
         uv_cfg = uvicorn.Config(
             self.app,
@@ -1297,6 +1386,13 @@ class WebAdminServer:
         async def _serve():
             try:
                 await self.server.serve()
+            except SystemExit as e:
+                # Uvicorn 启动失败（如端口竞争竞态）会抛 SystemExit，必须拦截，
+                # 否则会导致宿主 AstrBot 进程随之退出喵。
+                logger.error(
+                    f"[主动消息] Web 管理端启动失败喵（退出码 {e.code}），"
+                    f"请检查端口 {host}:{port} 是否被占用喵。"
+                )
             except Exception as e:
                 logger.error(f"[主动消息] Web 管理端运行异常喵: {e}")
 
@@ -1322,6 +1418,15 @@ class WebAdminServer:
 
         # 略等一个事件循环切片，让服务有机会完成绑定后再打印启动日志。
         await asyncio.sleep(0.1)
+        if self.server_task.done():
+            # 任务在极短时间内就结束，说明绑定或启动阶段已失败，此时不应
+            # 误报“已启动”；异常信息已在 _serve 内记录，这里再兜底一次。
+            exc = self.server_task.exception()
+            if exc:
+                logger.error(f"[主动消息] Web 管理端启动失败喵: {exc}")
+            else:
+                logger.error("[主动消息] Web 管理端启动失败喵: 服务任务已意外退出。")
+            return
         logger.info(f"[主动消息] Web 管理端已启动喵: http://{host}:{port}")
 
     async def stop(self) -> None:
@@ -1335,8 +1440,18 @@ class WebAdminServer:
             try:
                 # 最多等待 5 秒，避免插件卸载时无限阻塞。
                 await asyncio.wait_for(self.server_task, timeout=5)
+            except asyncio.TimeoutError:
+                # 优雅退出超时则强制取消任务，确保监听 socket 一定被释放，
+                # 否则端口会继续被占用，导致插件重载后无法重新绑定。
+                self.server_task.cancel()
+                try:
+                    await self.server_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             except Exception:
                 pass
+        self.server_task = None
+        self.server = None
 
         self._ws_connections.clear()
         logger.info("[主动消息] Web 管理端已停止喵。")
